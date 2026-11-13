@@ -1,9 +1,9 @@
 #![no_std]
 #![no_main]
 
-use defmt::*;
+use defmt::info;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -11,43 +11,23 @@ use {defmt_rtt as _, panic_probe as _};
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(Default::default());
     
-    let button = Input::new(p.PA0, Pull::Down);
-
     let mut led_orange = Output::new(p.PD13, Level::Low, Speed::Low);
     let mut led_green  = Output::new(p.PD12, Level::Low, Speed::Low);
     let mut led_red    = Output::new(p.PD14, Level::Low, Speed::Low);
     let mut led_blue   = Output::new(p.PD15, Level::Low, Speed::Low);
 
-    let mut state = 0u8;
-    let mut last_pressed = false;
+    let mut count = 0u8;
 
     loop {
-        let pressed = button.is_high();
+            let state = (31 - count).min(count);
+            count = (count + 1) % 32;
+            info!("[ STATE ]: {}", state);
 
-        if pressed && !last_pressed {
-            info!("[ BUTTON ]");
+            led_green.set_level((state >> 0 & 1 == 1).into());
+            led_orange.set_level((state >> 1 & 1 == 1).into());
+            led_red.set_level((state >> 2 & 1 == 1).into());
+            led_blue.set_level((state >> 3 & 1 == 1).into());
 
-            led_orange.set_low();
-            led_green.set_low();
-            led_red.set_low();
-            led_blue.set_low();
-
-            match state {
-                0 => { info!("[ ORN ]"); led_orange.set_high(); }
-                1 => { info!("[ GRN ]");  led_green.set_high();  }
-                2 => { info!("[ RED ]");    led_red.set_high();    }
-                3 => { info!("[ BLU ]");   led_blue.set_high();   }
-                _ => { info!("[ ALL ]");
-                       led_orange.set_high();
-                       led_green.set_high();
-                       led_red.set_high();
-                       led_blue.set_high(); }
-            }
-
-            state = (state + 1) % 5;
-        }
-
-        last_pressed = pressed;
-        Timer::after_millis(50).await;
+            Timer::after_millis(90).await;
     }
 }
