@@ -1,4 +1,4 @@
-use sinn2::audio::{SAMPLE_RATE, StereoFrame, Tone};
+use sinn2::audio::{G7Chord, SAMPLE_RATE, StereoFrame};
 use std::env;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -35,13 +35,13 @@ fn main() -> io::Result<()> {
     output.write_all(b"data")?;
     output.write_all(&DATA_BYTES.to_le_bytes())?;
 
-    let mut tone = Tone::new();
+    let mut chord = G7Chord::new();
     let mut frames: [StereoFrame; 1024] = [[0; 2]; 1024];
     let mut bytes = [0u8; 4096];
     let mut remaining = FRAME_COUNT as usize;
     while remaining != 0 {
         let count = remaining.min(frames.len());
-        tone.fill(&mut frames[..count]);
+        chord.fill(&mut frames[..count]);
         for (frame, encoded) in frames[..count].iter().zip(bytes.chunks_exact_mut(4)) {
             encoded[..2].copy_from_slice(&frame[0].to_le_bytes());
             encoded[2..].copy_from_slice(&frame[1].to_le_bytes());

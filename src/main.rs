@@ -1,4 +1,4 @@
-//! Quiet stereo test tones through the STM32F411E-DISCO headphone jack.
+//! Hold the user button for a quiet G3–B3–D4–F4 chord in both headphone channels.
 //! PC12=SD, PA4=WS, PC10=CK, PC7=MCLK; PB6/PB9=I2C1; PD4=codec reset.
 
 #![no_std]
@@ -6,7 +6,7 @@
 
 use defmt_rtt as _;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
 use embassy_stm32::i2c::{self, I2c, Master};
 use embassy_stm32::i2s::{self, Format, I2S};
 use embassy_stm32::mode::Blocking;
@@ -14,7 +14,7 @@ use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, dma, peripherals};
 use embassy_time::{Duration, Timer};
 use panic_probe as _;
-use sinn2::audio::{SAMPLE_RATE, Tone};
+use sinn2::audio::{G7Chord, SAMPLE_RATE};
 use sinn2::codec::{self, Cs43l22};
 
 const DMA_WORDS: usize = 2048;
@@ -74,6 +74,8 @@ fn clock_config() -> embassy_stm32::Config {
 async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(clock_config());
     let mut reset = Output::new(p.PD4, Level::Low, Speed::Low);
+    // The onboard user button drives PA0 high while held; this is not a toggle.
+    let user_button = Input::new(p.PA0, Pull::Down);
 
     let mut control_config = i2c::Config::default();
     control_config.frequency = Hertz(100_000);
@@ -98,7 +100,7 @@ async fn main(_spawner: Spawner) {
             }
         }
     };
-    defmt::info!("codec configured; starting nominal 48 khz stereo, left 750 hz / right 1500 hz");
+    defmt::info!("codec configured; hold user button for g3-b3-d4-f4 in both channels");
 
     let mut dma_buffer = [0u16; DMA_WORDS];
     let mut audio_config = i2s::Config::default();
@@ -135,9 +137,10 @@ async fn main(_spawner: Spawner) {
         defmt::panic!("codec start i2c error: {:?}", error);
     }
 
-    let mut tone = Tone::new();
+    let mut chord = G7Chord::new();
     loop {
-        tone.fill(&mut frames);
+        // Keep DMA and codec clocks running on release, but queue digital silence.
+        chord.fill_gated(&mut frames, user_button.is_high());
         if let Err(error) = audio.write(frames.as_flattened()).await {
             // Fail closed instead of silently replaying stale DMA data or swapping channels.
             reset.set_low();

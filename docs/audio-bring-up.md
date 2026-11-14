@@ -7,12 +7,17 @@ remains unchanged.
 ## Implementation status
 
 - The release firmware cross-compiles and links for `thumbv7em-none-eabihf`.
-- All 48 library host tests pass: nine audio/codec tests, 37 upstream Embassy
+- All 52 library host tests pass: thirteen audio/codec tests, 37 upstream Embassy
   ring-buffer tests, and two startup-specific checks.
 - The host WAV exporter runs; its header and all 96,000 stereo frames were
   independently checked using Python's `wave` and `struct` modules.
-- No board is present. Codec response, actual clocks, interrupt behavior, and
-  audible playback remain unverified. Compilation is not a hardware test.
+- The user confirmed that the stereo test-tone firmware works on hardware.
+  This supersedes the earlier software-only status. Exact clock measurements
+  and extended timing/stability tests have not been reported.
+- The generator now plays G7 (G3–B3–D4–F4) identically in both channels while
+  the user button is held; release produces digital silence. The
+  confirmed hardware result above applies to the earlier test-tone generator;
+  hardware confirmation of the chord change is still pending.
 
 ## Files
 
@@ -20,7 +25,7 @@ remains unchanged.
 | --- | --- |
 | `src/main.rs` | MCU clocks, reset, I2C adapter, I2S/DMA, startup, error handling |
 | `src/codec.rs` | CS43L22 initialization and playback control; scripted bus tests |
-| `src/audio.rs` | Shared fixed stereo sine generator and continuity/format tests |
+| `src/audio.rs` | Shared four-voice G7 generator and tuning/continuity/format tests |
 | `src/lib.rs` | Hardware-independent, `no_std` library |
 | `src/render_wav.rs` | Desktop-only `render-wav` Cargo example |
 | `src/tests/dma.rs` | Host DMA-ring startup regression tests and minimal shim |
@@ -50,6 +55,7 @@ PCM samples -> RAM ring -> DMA1 -> SPI3/I2S3 -> CS43L22 -> headphone jack
 | Master clock | PC7, I2S3 MCK, AF6 |
 | Control clock/data | PB6/PB9, I2C1, AF4 |
 | Active-low codec reset | PD4 |
+| Active-high user button | PA0, input with pull-down |
 | Transmit DMA | DMA1 stream 7, request channel 0 |
 
 Embassy's `DMA1_CH7` token names the stream, not ST request channel 7.
@@ -63,10 +69,29 @@ The MCU is master; the codec is slave. The transport uses Philips I2S,
 MCLK enabled. Cast signed `i16` samples to `u16` to preserve their two's-complement
 bits. Zero is silence: do not add an unsigned analog-DAC midpoint.
 
-The left tone has a 64-frame period; the right has a 32-frame period. At nominal
-48 kHz they are 750 Hz and 1500 Hz. Their PCM peak is 4096 (~-18 dBFS). The
-codec adds -30 dB master attenuation. These settings are conservative starting
-levels, not a guarantee of acoustic safety for every headphone/load.
+Both channels carry the same sustained G dominant seventh chord in equal
+temperament (A4 = 440 Hz): G3 (195.998 Hz), B3 (246.942 Hz), D4 (293.665 Hz),
+and F4 (349.228 Hz). Four independent 32-bit phase accumulators address the
+existing 64-point sine table with linear interpolation. Phase is retained across
+DMA blocks; the firmware uses no floating-point trigonometry or allocation.
+
+The four voices are averaged, not simply summed, keeping PCM magnitude at or
+below the previous 4096 bound (~-18 dBFS), even if all voices align. The codec's
+-30 dB master attenuation and hardware configuration are unchanged. These are
+conservative starting levels, not an acoustic-safety guarantee for every load.
+
+### User button
+
+Hold the onboard user button (PA0 high) to play; release it to output zeroes.
+This is momentary control, not a press-to-toggle switch. The button is sampled
+once per generated 256-frame block. The gate clears the whole block when released
+and retains the four oscillator phases for the next press. I2S, DMA, and the codec
+continue running during silence; they are not stopped/reinitialized on each press.
+
+Already queued audio cannot be withdrawn, so press/release response has a few
+tens of milliseconds of buffer latency, not an immediate hardware mute. No
+debounce or amplitude envelope is applied: mechanical bounce or a gate change
+away from a zero crossing can cause a brief click.
 
 For initial bring-up, the firmware deliberately uses the internal 16 MHz HSI,
 avoiding assumptions about a particular board revision's HSE crystal/bypass wiring:
@@ -94,7 +119,8 @@ The original linked Embassy example's 180 MHz SYSCLK is not legal for an F411.
 5. Explicitly queue a full ring of silence before starting I2S/DMA.
 6. Start MCLK/BCLK/LRCLK while the codec is still powered down.
 7. Power up, enable digital soft ramp, and unmute headphones; keep speakers muted.
-8. Continuously generate/refill tone blocks. Do not delay or log in the refill loop.
+8. Continuously refill chord blocks while the user button is held, or silence
+   blocks while released. Do not delay or log in the refill loop.
 
 Important corrections to the earlier notes/ST example:
 
@@ -140,12 +166,13 @@ Build outputs and generated audio stay under ignored `target/`.
 ```sh
 cargo fmt --all -- --check
 cargo test --locked --lib --target aarch64-apple-darwin
-cargo run --locked --example render-wav --target aarch64-apple-darwin -- target/tone.wav
+cargo run --locked --example render-wav --target aarch64-apple-darwin -- target/g7.wav
 ```
 
-`tone.wav` is two seconds of the exact generated PCM, without the codec's
+`g7.wav` is two seconds of the exact generated PCM, without the codec's
 additional -30 dB attenuation. Listen at low host volume. The exporter overwrites
-the output path supplied explicitly on the command line.
+the output path supplied explicitly on the command line. The desktop preview
+plays the chord continuously; it does not require or emulate the physical button.
 
 With a normal Rust toolchain that has the embedded target installed:
 
@@ -195,7 +222,8 @@ installed to avoid depending on that disposable copy.
 2. Flash/run using the F411VE target; confirm there is no codec-ID/I2C panic.
 3. Verify PC7 MCLK, PC10 BCLK, and PA4 LRCLK against the approximate values above.
 4. Check PC12 data and the one-bit Philips I2S delay if the clocks exist but audio fails.
-5. Confirm the left/right tones are distinct and sustained without a DMA panic.
+5. Confirm startup is silent; hold the user button to hear the same G7 chord in
+   both channels, then release and check that silence returns without a DMA panic.
 6. Only then consider volume changes, more accurate HSE clocks, stopping/restarting,
    file playback, microphone input, or other synthesizer features.
 
