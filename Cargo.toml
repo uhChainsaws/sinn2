@@ -3,7 +3,18 @@ name = "sinn2"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[[bin]]
+name = "sinn2"
+path = "src/main.rs"
+test = false
+bench = false
+
+[[example]]
+name = "render-wav"
+path = "src/render_wav.rs"
+
+# The sample generator and codec tests also run on a desktop without MCU crates.
+[target.'cfg(all(target_arch = "arm", target_os = "none"))'.dependencies]
 embassy-stm32 = { version = "0.6.0", features = ["defmt", "stm32f411ve", "unstable-pac", "memory-x", "time-driver-any", "exti", "chrono"]  }
 embassy-sync = { version = "0.8.0", features = ["defmt"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }

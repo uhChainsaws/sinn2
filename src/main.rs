@@ -1,132 +1,147 @@
-//! | stm32 | PCM5102 |
-//! |-------|---------|
-//! | pa4   | LCK     |
-//! | pc10  | BCK     |
-//! | pc12  | DIN     |
-//!
-//!
-//! ## PCM5102 module
-//!
-//! | Pin   | Connected to    |
-//! |-------|-----------------|
-//! | BCK   | pc10            |
-//! | DIN   | pc12            |
-//! | LCK   | pa4             |
-//! | GND   | Gnd             |
-//! | VIN   | +3V3            |
-//! | FLT   | Gnd or +3V3     |
-//! | DEMP  | Gnd             |
-//! | XSMT  | +3V3            |
-//! | A3V3  |                 |
-//! | AGND  | audio out gnd   |
-//! | ROUT  | audio out left  |
-//! | LROUT | audio out right |
-//!
-//! Notes: on the module (not the chip) A3V3 is connected to VIN and AGND is connected to GND
-//!
-//!
-//! Expected behavior: two different sine tone.
+//! Quiet stereo test tones through the STM32F411E-DISCO headphone jack.
+//! PC12=SD, PA4=WS, PC10=CK, PC7=MCLK; PB6/PB9=I2C1; PD4=codec reset.
 
 #![no_std]
 #![no_main]
 
-use cortex_m_rt::entry;
+use defmt_rtt as _;
+use embassy_executor::Spawner;
+use embassy_stm32::gpio::{Level, Output, Speed};
+use embassy_stm32::i2c::{self, I2c, Master};
+use embassy_stm32::i2s::{self, Format, I2S};
+use embassy_stm32::mode::Blocking;
+use embassy_stm32::time::Hertz;
+use embassy_stm32::{bind_interrupts, dma, peripherals};
+use embassy_time::{Duration, Timer};
+use panic_probe as _;
+use sinn2::audio::{SAMPLE_RATE, Tone};
+use sinn2::codec::{self, Cs43l22};
 
-use rtt_target::{rprintln, rtt_init_print};
+const DMA_WORDS: usize = 2048;
+const BLOCK_FRAMES: usize = 256;
 
-use stm32f4xx_hal::i2s::stm32_i2s_v12x::transfer::*;
-use stm32f4xx_hal::i2s::I2s;
-use stm32f4xx_hal::nb::block;
-use stm32f4xx_hal::pac::{Peripherals, SPI3};
-use stm32f4xx_hal::prelude::*;
-use stm32f4xx_hal::rcc::Config;
+bind_interrupts!(struct Irqs {
+    DMA1_STREAM7 => dma::InterruptHandler<peripherals::DMA1_CH7>;
+});
 
-const SAMPLE_RATE: u32 = 48_000;
+struct CodecBus(I2c<'static, Blocking, Master>);
 
-/// A sine wave spanning 64 samples
-///
-/// With a sample rate of 48 kHz, this produces a 750 Hz tone.
-const SINE_750: [i16; 64] = [
-    0, 3211, 6392, 9511, 12539, 15446, 18204, 20787, 23169, 25329, 27244, 28897, 30272, 31356,
-    32137, 32609, 32767, 32609, 32137, 31356, 30272, 28897, 27244, 25329, 23169, 20787, 18204,
-    15446, 12539, 9511, 6392, 3211, 0, -3211, -6392, -9511, -12539, -15446, -18204, -20787, -23169,
-    -25329, -27244, -28897, -30272, -31356, -32137, -32609, -32767, -32609, -32137, -31356, -30272,
-    -28897, -27244, -25329, -23169, -20787, -18204, -15446, -12539, -9511, -6392, -3211,
-];
+impl codec::ControlBus for CodecBus {
+    type Error = i2c::Error;
 
-/// A sine wave spanning 128 samples
-///
-/// With a sample rate of 48 kHz, this produces a 375 Hz tone.
-const SINE_375: [i16; 128] = [
-    0, 1607, 3211, 4807, 6392, 7961, 9511, 11038, 12539, 14009, 15446, 16845, 18204, 19519, 20787,
-    22004, 23169, 24278, 25329, 26318, 27244, 28105, 28897, 29621, 30272, 30851, 31356, 31785,
-    32137, 32412, 32609, 32727, 32767, 32727, 32609, 32412, 32137, 31785, 31356, 30851, 30272,
-    29621, 28897, 28105, 27244, 26318, 25329, 24278, 23169, 22004, 20787, 19519, 18204, 16845,
-    15446, 14009, 12539, 11038, 9511, 7961, 6392, 4807, 3211, 1607, 0, -1607, -3211, -4807, -6392,
-    -7961, -9511, -11038, -12539, -14009, -15446, -16845, -18204, -19519, -20787, -22004, -23169,
-    -24278, -25329, -26318, -27244, -28105, -28897, -29621, -30272, -30851, -31356, -31785, -32137,
-    -32412, -32609, -32727, -32767, -32727, -32609, -32412, -32137, -31785, -31356, -30851, -30272,
-    -29621, -28897, -28105, -27244, -26318, -25329, -24278, -23169, -22004, -20787, -19519, -18204,
-    -16845, -15446, -14009, -12539, -11038, -9511, -7961, -6392, -4807, -3211, -1607,
-];
+    fn write(&mut self, address: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.0.blocking_write(address, bytes)
+    }
 
-#[entry]
-fn main() -> ! {
-    rtt_init_print!();
-    let dp = Peripherals::take().unwrap();
-
-    // The 61440 kHz frequency can be divided to get exactly 48 kHz sample rate even when
-    // generating master clock
-    let mut rcc = dp.RCC.freeze(
-        Config::hse(8u32.MHz())
-            .sysclk(96.MHz())
-            .i2s_clk(61440.kHz()),
-    );
-
-    let gpioa = dp.GPIOA.split(&mut rcc);
-    let gpioc = dp.GPIOC.split(&mut rcc);
-
-    let i2s_pins = (gpioa.pa4, gpioc.pc10, SPI3::NoMck, gpioc.pc12);
-    let i2s = I2s::new(dp.SPI3, i2s_pins, &mut rcc);
-    let i2s_config = I2sTransferConfig::new_master()
-        .transmit()
-        .standard(Philips)
-        .data_format(Data32Channel32)
-        .request_frequency(SAMPLE_RATE);
-    let mut i2s_transfer = I2sTransfer::new(i2s, i2s_config);
-    rprintln!("Actual sample rate is {}", i2s_transfer.sample_rate());
-
-    let sine_375_1sec = SINE_375
-        .iter()
-        .map(|&x| {
-            let x = (x as i32) << 16;
-            (x, x)
-        })
-        .cycle()
-        .take(SAMPLE_RATE as usize);
-    let sine_750_1sec = SINE_750
-        .iter()
-        .map(|&x| {
-            let x = (x as i32) << 16;
-            (x, x)
-        })
-        .cycle()
-        .take(SAMPLE_RATE as usize);
-
-    loop {
-        // Play 375.1 Hz using non blocking api
-        for sample in sine_375_1sec.clone() {
-            block!(i2s_transfer.write(sample)).ok();
-        }
-        // Play 750 Hz using blocking api
-        i2s_transfer.write_iter(sine_750_1sec.clone());
+    fn write_read(
+        &mut self,
+        address: u8,
+        bytes: &[u8],
+        result: &mut [u8],
+    ) -> Result<(), Self::Error> {
+        self.0.blocking_write_read(address, bytes, result)
     }
 }
 
-use core::panic::PanicInfo;
-#[inline(never)]
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    rprintln!("{}", info);
-    loop {} // You might need a compiler fence in here.
+fn clock_config() -> embassy_stm32::Config {
+    use embassy_stm32::rcc::*;
+
+    let mut config = embassy_stm32::Config::default();
+    // HSI avoids depending on board-revision HSE wiring. Its tolerance affects pitch.
+    config.rcc.pll_src = PllSource::Hsi;
+    config.rcc.pll = Some(Pll {
+        prediv: PllPreDiv::Div16,
+        mul: PllMul::Mul192,
+        divp: Some(PllPDiv::Div2), // 16 MHz / 16 * 192 / 2 = 96 MHz (F411 max: 100).
+        divq: None,
+        divr: None,
+    });
+    config.rcc.sys = Sysclk::Pll1P;
+    config.rcc.ahb_pre = AHBPrescaler::Div1;
+    config.rcc.apb1_pre = APBPrescaler::Div2;
+    config.rcc.apb2_pre = APBPrescaler::Div1;
+    config.rcc.plli2s = Some(Pll {
+        prediv: PllPreDiv::Div16,
+        mul: PllMul::Mul258,
+        divp: None,
+        divq: None,
+        divr: Some(PllRDiv::Div3), // 86 MHz: Fs ~= 47991 Hz with 256x MCLK / divider 7.
+    });
+    config
+}
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    let p = embassy_stm32::init(clock_config());
+    let mut reset = Output::new(p.PD4, Level::Low, Speed::Low);
+
+    let mut control_config = i2c::Config::default();
+    control_config.frequency = Hertz(100_000);
+    // A failed control transaction must not stall startup indefinitely.
+    control_config.timeout = Duration::from_millis(10);
+    let control = I2c::new_blocking(p.I2C1, p.PB6, p.PB9, control_config);
+
+    // ST's board-level reset margins exceed the codec's 1 ms minimum low pulse.
+    Timer::after_millis(5).await;
+    reset.set_high();
+    Timer::after_millis(5).await;
+
+    let mut codec = match Cs43l22::configure(CodecBus(control)) {
+        Ok(codec) => codec,
+        Err(error) => {
+            reset.set_low();
+            match error {
+                codec::Error::Bus(error) => defmt::panic!("codec setup i2c error: {:?}", error),
+                codec::Error::UnexpectedId(id) => {
+                    defmt::panic!("unexpected codec id: {=u8:#x}", id)
+                }
+            }
+        }
+    };
+    defmt::info!("codec configured; starting nominal 48 khz stereo, left 750 hz / right 1500 hz");
+
+    let mut dma_buffer = [0u16; DMA_WORDS];
+    let mut audio_config = i2s::Config::default();
+    audio_config.frequency = Hertz(SAMPLE_RATE);
+    audio_config.format = Format::Data16Channel16;
+    audio_config.master_clock = true;
+    let mut audio = I2S::new_txonly(
+        p.SPI3,
+        p.PC12,
+        p.PA4,
+        p.PC10,
+        p.PC7,
+        p.DMA1_CH7,
+        Irqs,
+        &mut dma_buffer,
+        audio_config,
+    );
+
+    // A zero-filled allocation is not logically queued data in Embassy's TX ring.
+    // Prime the full ring before DMA starts, giving codec startup ~21 ms of silence.
+    let mut frames = [[0u16; 2]; BLOCK_FRAMES];
+    for _ in 0..DMA_WORDS / (2 * BLOCK_FRAMES) {
+        if let Err(error) = audio.write(frames.as_flattened()).await {
+            reset.set_low();
+            defmt::panic!("audio prefill error: {:?}", error);
+        }
+    }
+
+    // Apply clocks and silence while PDN is still set, then power up and unmute.
+    // Do not insert long awaits here: the running DMA ring needs timely refills.
+    audio.start();
+    if let Err(error) = codec.start() {
+        reset.set_low();
+        defmt::panic!("codec start i2c error: {:?}", error);
+    }
+
+    let mut tone = Tone::new();
+    loop {
+        tone.fill(&mut frames);
+        if let Err(error) = audio.write(frames.as_flattened()).await {
+            // Fail closed instead of silently replaying stale DMA data or swapping channels.
+            reset.set_low();
+            defmt::panic!("audio dma error: {:?}", error);
+        }
+    }
 }
